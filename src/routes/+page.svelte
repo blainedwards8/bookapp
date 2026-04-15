@@ -206,12 +206,31 @@
                             {#if editingId === story.id}
                                 <div class="edit-mode-container">
                                     <form method="POST" action="?/update" use:enhance={() => {
-                                        return async ({ update }) => {
-                                            await update();
-                                            editingId = null;
+                                        return async ({ result, update }) => {
+                                            if (result.type === 'success') {
+                                                await update();
+                                                editingId = null;
+                                            } else if (result.type === 'failure') {
+                                                // Don't close or update if it failed
+                                                console.error('Update failed:', result.data);
+                                                // result.data will contain the { error, details } from fail()
+                                                await update({ reset: false });
+                                            } else {
+                                                await update();
+                                            }
                                         };
                                     }}>
                                         <input type="hidden" name="id" value={story.id} />
+                                        
+                                        {#if data.form?.error && editingId === story.id}
+                                            <div class="inline-error-banner">
+                                                {data.form.error}
+                                                {#if data.form.details}
+                                                    <pre>{JSON.stringify(data.form.details, null, 2)}</pre>
+                                                {/if}
+                                            </div>
+                                        {/if}
+
                                         <div class="edit-fields">
                                             <input name="book_title" value={story.book_title} class="edit-input" placeholder="Book Title" />
                                             <input name="title" value={story.title} class="edit-input" placeholder="Story Title" />
@@ -490,4 +509,22 @@
     .import-banner { padding: 0.75rem 1rem; border-radius: 6px; margin-bottom: 1rem; font-size: 0.9rem; font-weight: 500; }
     .import-banner.success { background: #dcfce7; color: #166534; border: 1px solid #bbf7d0; }
     .import-banner.error   { background: #fee2e2; color: #b91c1c; border: 1px solid #fecaca; }
+
+    .inline-error-banner {
+        background: #fee2e2;
+        color: #b91c1c;
+        border: 1px solid #fecaca;
+        padding: 0.75rem;
+        border-radius: 6px;
+        margin-bottom: 1rem;
+        font-size: 0.85rem;
+    }
+    .inline-error-banner pre {
+        margin-top: 0.5rem;
+        font-size: 0.75rem;
+        white-space: pre-wrap;
+        background: rgba(255, 255, 255, 0.5);
+        padding: 0.5rem;
+        border-radius: 4px;
+    }
 </style>

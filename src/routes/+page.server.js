@@ -156,34 +156,37 @@ export const actions = {
         const id = data.get('id');
         const bookTitle = data.get('book_title');
 
+        if (!id) {
+            return fail(400, { error: 'Missing story ID' });
+        }
+
+        const tagsRaw = data.get('tags') ?? '';
         const payload = {
             title: data.get('title'),
             author: data.get('author'),
             page: parseInt(data.get('page_number')) || 0,
             summary: data.get('summary'),
             content: data.get('content') ?? '',
-            tags: data.get('tags').split(',').map(t => t.trim()).filter(Boolean)
+            tags: tagsRaw ? tagsRaw.split(',').map(t => t.trim()).filter(Boolean) : []
         };
 
-        // Resolve book relation if book_title was provided in the form
-        if (bookTitle?.trim()) {
-            payload.book = await findOrCreateBook(locals.pb, bookTitle);
-        }
-
-        console.log('[update] payload:', JSON.stringify(payload, null, 2));
-
         try {
-            await locals.pb.collection('story').update(id, payload);
-        } catch (e) {
-            // Log the full PocketBase validation details so we can see the exact field failing
-            console.error('[update] PocketBase error status:', e.status);
-            console.error('[update] PocketBase error data:', JSON.stringify(e.data, null, 2));
-            console.error('[update] PocketBase response:', JSON.stringify(e.response, null, 2));
-            throw e;
-        }
+            // Resolve book relation if book_title was provided in the form
+            if (bookTitle?.trim()) {
+                payload.book = await findOrCreateBook(locals.pb, bookTitle);
+            }
 
-        return { success: true };
+            await locals.pb.collection('story').update(id, payload);
+            return { success: true };
+        } catch (e) {
+            console.error('[update] Failure:', e.status, JSON.stringify(e.data, null, 2));
+            return fail(e.status || 400, { 
+                error: e.message || 'Failed to update record',
+                details: e.data || null 
+            });
+        }
     },
+
 
 
 
