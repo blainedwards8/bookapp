@@ -11,6 +11,7 @@
     let selectedBook = $state("All Books");
     let importMode = $state(false);
     let isGenerating = $state(false);
+    let importResult = $state(null); // { created, errors? } or { error }
 
     // Svelte 5 Derived Rune: Get unique list of books for the filter
     let bookList = $derived([...new Set(data.stories.map(s => s.book_title))].sort());
@@ -18,9 +19,10 @@
     // Svelte 5 Derived Rune: Groups and filters stories
     let groupedByBook = $derived.by(() => {
         const filtered = data.stories.filter(s => {
+            const tagsStr = Array.isArray(s.tags) ? s.tags.join(', ') : (s.tags ?? '');
             const matchesSearch = s.title.toLowerCase().includes(searchQuery.toLowerCase()) || 
                                 s.author.toLowerCase().includes(searchQuery.toLowerCase()) ||
-                                s.tags.toLowerCase().includes(searchQuery.toLowerCase()) ||
+                                tagsStr.toLowerCase().includes(searchQuery.toLowerCase()) ||
                                 s.book_title.toLowerCase().includes(searchQuery.toLowerCase());
             
             const matchesBook = selectedBook === "All Books" || s.book_title === selectedBook;
@@ -49,17 +51,18 @@
                 method: 'POST',
                 body: formData
             });
-
             const result = await response.json();
             
             // SvelteKit returns a JSON string that looks like [ "type", { data } ]
             const parsed = JSON.parse(result.data);
-            if (parsed[1] === true) {
+            const data = JSON.parse(parsed[1]);
+
+            if (data.success) {
                 // Find the textarea and set its value
                 const textarea = form.querySelector('textarea[name="summary"]');
-                if (textarea) textarea.value = parsed[2];
+                if (textarea) textarea.value = data.summary;
             } else {
-                alert(parsed.error || "Failed to generate summary");
+                alert(data.error || "Failed to generate summary");
             }
         } catch (err) {
             console.error(err);
@@ -89,6 +92,9 @@
             <button class="add-btn" onclick={() => showAddForm = !showAddForm}>
                 {showAddForm ? 'Close Form' : '+ New Entry'}
             </button>
+            <form method="POST" action="?/logout" use:enhance>
+                <button type="submit" class="logout-btn">Sign Out</button>
+            </form>
         </div>
     </header>
 
@@ -103,10 +109,19 @@
 
             {#if importMode}
                 <form method="POST" action="?/import" use:enhance={() => {
-                    return async ({ update }) => {
-                        await update();
-                        showAddForm = false;
-                        importMode = false;
+                    importResult = null;
+                    return async ({ result, update }) => {
+                        if (result.type === 'success') {
+                            importResult = result.data;
+                            await update({ reset: false });
+                            if (!result.data?.errors?.length) {
+                                setTimeout(() => { showAddForm = false; importMode = false; }, 1500);
+                            }
+                        } else if (result.type === 'failure') {
+                            importResult = { error: result.data?.error ?? 'Import failed.' };
+                        } else {
+                            await update();
+                        }
                     };
                 }}>
                     <div class="field full">
@@ -117,8 +132,19 @@
                             placeholder={`[{"book_title": "...", "title": "...", ...}]`}
                             required
                         ></textarea>
-                        <p class="help-text">Ensure the format is a JSON array of story objects.</p>
+                        <p class="help-text">Paste a JSON array. Each object needs at least <code>book_title</code>, <code>title</code>, and <code>author</code>.</p>
                     </div>
+
+                    {#if importResult}
+                        {#if importResult.error}
+                            <div class="import-banner error">{importResult.error}</div>
+                        {:else}
+                            <div class="import-banner success">✓ Imported {importResult.created} stor{importResult.created === 1 ? 'y' : 'ies'} successfully.
+                                {#if importResult.errors?.length}<br/><small>Skipped: {importResult.errors.join('; ')}</small>{/if}
+                            </div>
+                        {/if}
+                    {/if}
+
                     <button type="submit" class="submit-btn import-color">Import All Stories</button>
                 </form>
             {:else}
@@ -205,7 +231,10 @@
                                             </div>
                                             <textarea name="summary" class="edit-input" placeholder="Summary">{story.summary}</textarea>
                                             
-                                            <input name="tags" value={story.tags} class="edit-input" placeholder="Tags" />
+                                            <label class="edit-label">Story Content</label>
+                                            <textarea name="content" class="edit-input content-area" placeholder="Paste or type the full story text here...">{story.content ?? ''}</textarea>
+                                            
+                                            <input name="tags" value={Array.isArray(story.tags) ? story.tags.join(', ') : story.tags} class="edit-input" placeholder="Tags" />
                                         </div>
                                         
                                         <div class="edit-actions">
@@ -228,13 +257,16 @@
                                     <p class="author-label">by {story.author}</p>
                                     <p class="summary-text">{story.summary || 'No summary provided.'}</p>
                                     <div class="tag-list">
-                                        {#each story.tags.split(',') as tag}
-                                            {#if tag.trim()}
+                                        {#each (Array.isArray(story.tags) ? story.tags : (typeof story.tags === 'string' ? story.tags.split(',') : [])) as tag}
+                                            {#if typeof tag === 'string' && tag.trim()}
                                                 <span class="tag">#{tag.trim()}</span>
                                             {/if}
                                         {/each}
                                     </div>
-                                    <button class="inline-edit-btn" onclick={() => toggleEdit(story.id)}>Edit Entry</button>
+                                    <div class="card-actions">
+                                        <a href="/story/{story.id}" class="read-btn">Read Story →</a>
+                                        <button class="inline-edit-btn" onclick={() => toggleEdit(story.id)}>Edit Entry</button>
+                                    </div>
                                 </div>
                             {/if}
                         </article>
@@ -303,6 +335,18 @@
         font-weight: 600;
         cursor: pointer;
     }
+
+    .logout-btn {
+        background: none;
+        border: 1px solid #cbd5e1;
+        color: #64748b;
+        padding: 0.6rem 1.2rem;
+        border-radius: 8px;
+        font-weight: 500;
+        cursor: pointer;
+        transition: background 0.15s, color 0.15s;
+    }
+    .logout-btn:hover { background: #fee2e2; color: #b91c1c; border-color: #fecaca; }
 
     .form-section {
         background: white;
@@ -400,8 +444,26 @@
     .author-label { font-style: italic; color: #64748b; margin-top: 0; margin-bottom: 1rem; }
     .summary-text { font-size: 0.925rem; line-height: 1.5; color: #334155; margin-bottom: 1.5rem; }
 
-    .tag-list { display: flex; flex-wrap: wrap; gap: 0.5rem; }
+    .tag-list { display: flex; flex-wrap: wrap; gap: 0.5rem; margin-bottom: 0.5rem; }
     .tag { font-size: 0.75rem; color: #2563eb; background: #eff6ff; padding: 2px 8px; border-radius: 4px; font-weight: 500; }
+
+    .card-actions { display: flex; align-items: center; justify-content: space-between; margin-top: 1.25rem; }
+
+    .read-btn {
+        font-size: 0.85rem;
+        font-weight: 600;
+        color: #2563eb;
+        text-decoration: none;
+        padding: 0.35rem 0.75rem;
+        border: 1px solid #bfdbfe;
+        border-radius: 6px;
+        background: #eff6ff;
+        transition: background 0.15s, border-color 0.15s;
+    }
+    .read-btn:hover { background: #dbeafe; border-color: #93c5fd; }
+
+    .edit-label { font-size: 0.8rem; font-weight: 600; color: #64748b; margin-bottom: 0.25rem; display: block; }
+    .content-area { min-height: 200px; font-family: Georgia, serif; font-size: 0.95rem; line-height: 1.7; }
 
     .inline-edit-btn {
         margin-top: 1.5rem;
@@ -425,4 +487,7 @@
     .delete-form { border-top: 1px solid #f1f5f9; padding-top: 1rem; }
     .delete-btn { width: 100%; background: #fee2e2; color: #b91c1c; border: 1px solid #fecaca; padding: 0.5rem; border-radius: 4px; cursor: pointer; font-size: 0.875rem; }
     .delete-btn:hover { background: #fecaca; }
+    .import-banner { padding: 0.75rem 1rem; border-radius: 6px; margin-bottom: 1rem; font-size: 0.9rem; font-weight: 500; }
+    .import-banner.success { background: #dcfce7; color: #166534; border: 1px solid #bbf7d0; }
+    .import-banner.error   { background: #fee2e2; color: #b91c1c; border: 1px solid #fecaca; }
 </style>
