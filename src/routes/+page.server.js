@@ -1,4 +1,6 @@
 import { redirect, fail } from '@sveltejs/kit';
+import { aiQueue } from '$lib/server/aiQueue';
+import { callOllama } from '$lib/server/ai';
 
 // Looks up a book by title; creates it if it doesn't exist. Returns the book ID.
 async function findOrCreateBook(pb, title) {
@@ -14,45 +16,42 @@ async function findOrCreateBook(pb, title) {
     }
 }
 
-// Helper for calling Ollama with exponential backoff
-async function callOllama(prompt) {
-    const url = `https://ai.a13.in/api/generate`;
-    const payload = { model: "llama3", prompt: prompt, stream: false };
-
-    let delay = 1000;
-    for (let i = 0; i < 5; i++) {
-        try {
-            const response = await fetch(url, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(payload)
-            });
-            if (!response.ok) throw new Error('Ollama request failed');
-            const result = await response.json();
-            return result.response;
-        } catch (e) {
-            if (i === 4) throw e;
-            await new Promise(resolve => setTimeout(resolve, delay));
-            delay *= 2;
-        }
-    }
-}
-
-export const load = async ({ locals }) => {
+export const load = async ({ locals, url }) => {
     // If user is not logged in, redirect to login
     if (!locals.user) {
         throw redirect(303, '/login');
     }
 
+    const page = parseInt(url.searchParams.get('page')) || 1;
+    const perPage = parseInt(url.searchParams.get('perPage')) || 25;
+    const search = url.searchParams.get('search') || '';
+    const bookFilter = url.searchParams.get('book') || 'All Books';
+
     try {
-        const stories = await locals.pb.collection('story').getFullList({
+        let filter = '';
+        if (search) {
+            const cleanSearch = search.replace(/"/g, '\\"');
+            filter = `(title ~ "${cleanSearch}" || author ~ "${cleanSearch}" || summary ~ "${cleanSearch}" || tags ~ "${cleanSearch}")`;
+        }
+
+        if (bookFilter !== 'All Books') {
+            const cleanBook = bookFilter.replace(/"/g, '\\"');
+            const bFilter = `book.title = "${cleanBook}"`;
+            filter = filter ? `(${filter}) && ${bFilter}` : bFilter;
+        }
+
+        const result = await locals.pb.collection('story').getList(page, perPage, {
             sort: 'created',
-            expand: 'book'
+            expand: 'book',
+            filter: filter
+        });
+
+        const books = await locals.pb.collection('book').getFullList({
+            sort: 'title'
         });
 
         // Normalize: surface the expanded book title as a flat `book_title` field
-        // so the frontend can use `story.book_title` directly.
-        const normalized = stories.map(s => ({
+        const normalized = result.items.map(s => ({
             ...s,
             book_title: s.expand?.book?.title ?? s.book_title ?? 'Unknown Book',
             page_number: s.page ?? s.page_number ?? 0
@@ -60,11 +59,27 @@ export const load = async ({ locals }) => {
         
         return {
             stories: JSON.parse(JSON.stringify(normalized)),
+            books: JSON.parse(JSON.stringify(books)),
+            pagination: {
+                page: result.page,
+                perPage: result.perPage,
+                totalItems: result.totalItems,
+                totalPages: result.totalPages
+            },
+            search,
+            selectedBook: bookFilter,
             user: locals.user
         };
     } catch (e) {
         console.error("Failed to load stories:", e);
-        return { stories: [], user: locals.user };
+        return { 
+            stories: [], 
+            books: [],
+            pagination: { page: 1, perPage, totalItems: 0, totalPages: 0 },
+            search,
+            selectedBook: bookFilter,
+            user: locals.user 
+        };
     }
 };
 
@@ -80,14 +95,30 @@ export const actions = {
         try {
             const bookId = await findOrCreateBook(locals.pb, data.get('book_title'));
             const tagsRaw = data.get('tags') ?? '';
-            await locals.pb.collection('story').create({
+            const title = data.get('title');
+            const author = data.get('author');
+            const summary = data.get('summary');
+            const tags = tagsRaw ? tagsRaw.split(',').map(t => t.trim()).filter(Boolean) : [];
+
+            // Create story with queued flag true
+            const story = await locals.pb.collection('story').create({
                 book: bookId,
-                title: data.get('title'),
-                author: data.get('author'),
+                title,
+                author,
                 page: parseInt(data.get('page_number')) || 0,
-                summary: data.get('summary'),
-                tags: tagsRaw ? tagsRaw.split(',').map(t => t.trim()).filter(Boolean) : []
+                summary,
+                tags,
+                queued: true
             });
+
+            // Enqueue summary generation
+            aiQueue.push({
+                storyId: story.id,
+                title,
+                author,
+                content: '' // New stories don't have content yet in the add form
+            });
+
             return { success: true };
         } catch (e) {
             console.error('Create failed:', e);
@@ -188,8 +219,6 @@ export const actions = {
     },
 
 
-
-
     delete: async ({ request, locals }) => {
         if (!locals.user) throw redirect(303, '/login');
         const data = await request.formData();
@@ -200,13 +229,55 @@ export const actions = {
     generateSummary: async ({ request, locals }) => {
         if (!locals.user) return { success: false, error: "Unauthorized" };
         const data = await request.formData();
-        const prompt = `Provide a short summary for "${data.get('title')}" by ${data.get('author')}.`;
+        const storyId = data.get('id');
+        const title = data.get('title');
+        const author = data.get('author');
+        const content = data.get('content') || '';
+
+        if (!storyId) return fail(400, { error: "Missing story ID" });
 
         try {
-            const summary = await callOllama(prompt);
-            return { success: true, summary: summary.trim() };
+            // Update story to show it's queued
+            await locals.pb.collection('story').update(storyId, { queued: true });
+
+            // Enqueue task
+            aiQueue.push({ storyId, title, author, content });
+
+            return { success: true, queued: true };
         } catch (e) {
-            return { success: false, error: "AI generation failed." };
+            console.error('[generateSummary] Failed:', e);
+            return fail(500, { error: "Failed to enqueue task" });
+        }
+    },
+
+    bulkGenerate: async ({ locals }) => {
+        if (!locals.user) return { success: false, error: "Unauthorized" };
+        
+        try {
+            // Fetch stories that don't have a summary and aren't already queued
+            // Need to filter locally if PocketBase doesn't support complex empty/null checks easily
+            const stories = await locals.pb.collection('story').getFullList({
+                filter: 'summary = "" && queued = false',
+                expand: 'book'
+            });
+
+            for (const story of stories) {
+                // Mark as queued
+                await locals.pb.collection('story').update(story.id, { queued: true });
+                
+                // Enqueue
+                aiQueue.push({
+                    storyId: story.id,
+                    title: story.title,
+                    author: story.author,
+                    content: story.content || ''
+                });
+            }
+
+            return { success: true, count: stories.length };
+        } catch (e) {
+            console.error('[bulkGenerate] Failed:', e);
+            return fail(500, { error: e.message });
         }
     }
 };

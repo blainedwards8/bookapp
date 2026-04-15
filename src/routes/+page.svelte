@@ -1,72 +1,134 @@
 <script>
-    import { enhance } from '$app/forms';
+            import { onMount, onDestroy } from 'svelte';
+    import pb from '$lib/pocketbase';
     
-    // Svelte 5 uses $props() for data
+    import { invalidateAll } from '$app/navigation';
+    
+    // ... same states ...
     let { data } = $props();
 
     // UI States
     let editingId = $state(null);
     let showAddForm = $state(false);
-    let searchQuery = $state("");
-    let selectedBook = $state("All Books");
+    let searchQuery = $state(data.search);
+    let selectedBook = $state(data.selectedBook);
+    let perPage = $state(data.pagination.perPage);
     let importMode = $state(false);
-    let isGenerating = $state(false);
+    let isGenerating = $state(false); // Used for bulk or immediate UI feedback
     let importResult = $state(null); // { created, errors? } or { error }
 
-    // Svelte 5 Derived Rune: Get unique list of books for the filter
-    let bookList = $derived([...new Set(data.stories.map(s => s.book_title))].sort());
-
-    // Svelte 5 Derived Rune: Groups and filters stories
-    let groupedByBook = $derived.by(() => {
-        const filtered = data.stories.filter(s => {
-            const tagsStr = Array.isArray(s.tags) ? s.tags.join(', ') : (s.tags ?? '');
-            const matchesSearch = s.title.toLowerCase().includes(searchQuery.toLowerCase()) || 
-                                s.author.toLowerCase().includes(searchQuery.toLowerCase()) ||
-                                tagsStr.toLowerCase().includes(searchQuery.toLowerCase()) ||
-                                s.book_title.toLowerCase().includes(searchQuery.toLowerCase());
-            
-            const matchesBook = selectedBook === "All Books" || s.book_title === selectedBook;
-            
-            return matchesSearch && matchesBook;
+    // Real-time subscription for automatic updates
+    onMount(() => {
+        pb.collection('story').subscribe('*', function (e) {
+            if (e.action === 'update') {
+                invalidateAll();
+            }
         });
+    });
 
-        return filtered.reduce((acc, story) => {
+    onDestroy(() => {
+        pb.collection('story').unsubscribe('*');
+    });
+
+    // Helper to find a story in the current dataset
+    function getStoryById(id) {
+        return data.stories.find(s => s.id === id);
+    }
+
+    // Svelte 5 Derived Rune: Get unique list of books from server-provided books collection
+    let bookList = $derived(data.books.map(b => b.title));
+
+    // Svelte 5 Derived Rune: Groups stories
+    let groupedByBook = $derived.by(() => {
+        return data.stories.reduce((acc, story) => {
             if (!acc[story.book_title]) acc[story.book_title] = [];
             acc[story.book_title].push(story);
             return acc;
         }, {});
     });
 
+    function updateFilters() {
+        const url = new URL(window.location.href);
+        if (searchQuery) url.searchParams.set('search', searchQuery);
+        else url.searchParams.delete('search');
+        
+        if (selectedBook !== 'All Books') url.searchParams.set('book', selectedBook);
+        else url.searchParams.delete('book');
+        
+        url.searchParams.set('perPage', perPage);
+        url.searchParams.set('page', '1');
+        goto(url.toString(), { keepFocus: true, noScroll: true });
+    }
+
+    function goToPage(p) {
+        const url = new URL(window.location.href);
+        url.searchParams.set('page', p);
+        goto(url.toString(), { noScroll: false });
+    }
+
+    let searchTimeout;
+    function handleSearchInput() {
+        clearTimeout(searchTimeout);
+        searchTimeout = setTimeout(updateFilters, 500);
+    }
+
     const toggleEdit = (id) => editingId = editingId === id ? null : id;
 
-    // AI Summary Generation Logic
+    // AI Summary Generation - Now Backgrounded
     async function handleAISummary(e, storyId) {
         const form = e.target.closest('form');
         const formData = new FormData(form);
         
-        isGenerating = true;
+        // If it's a new story (storyId is null), we don't have an ID yet.
+        // But the user's plan says "On New Stories, let's save the record".
+        // The 'create' action already handles set queued: true and enqueue.
+        // So for the Add form, we just submit the form normally.
         
+        if (!storyId) {
+            // This is handled by the normal form submission in 'create' action
+            return;
+        }
+
+        isGenerating = true;
         try {
             const response = await fetch('?/generateSummary', {
                 method: 'POST',
                 body: formData
             });
             const result = await response.json();
-            
-            // SvelteKit returns a JSON string that looks like [ "type", { data } ]
             const parsed = JSON.parse(result.data);
-            const data = JSON.parse(parsed[1]);
+            const resData = JSON.parse(parsed[1]);
 
-            if (data.success) {
-                // Find the textarea and set its value
-                const textarea = form.querySelector('textarea[name="summary"]');
-                if (textarea) textarea.value = data.summary;
+            if (!resData.success) {
+                alert(resData.error || "Failed to enqueue summary task");
+            }
+            // If success, the background worker will update the DB and real-time will refresh the UI
+        } catch (err) {
+            console.error(err);
+            alert("Connection error.");
+        } finally {
+            isGenerating = false;
+        }
+    }
+
+    async function handleBulkSummarize() {
+        if (!confirm('Queue all stories without summaries for AI generation?')) return;
+        
+        isGenerating = true;
+        try {
+            const response = await fetch('?/bulkGenerate', { method: 'POST' });
+            const result = await response.json();
+            const parsed = JSON.parse(result.data);
+            const resData = JSON.parse(parsed[1]);
+
+            if (resData.success) {
+                alert(`Successfully enqueued ${resData.count} stories for summarization.`);
             } else {
-                alert(data.error || "Failed to generate summary");
+                alert(resData.error || "Bulk generation failed.");
             }
         } catch (err) {
             console.error(err);
-            alert("An error occurred while connecting to the AI.");
+            alert("Error starting bulk process.");
         } finally {
             isGenerating = false;
         }
@@ -77,18 +139,41 @@
     <header class="main-header">
         <h1>Short Story Archive</h1>
         <div class="controls">
-            <select bind:value={selectedBook} class="filter-select">
-                <option value="All Books">All Books</option>
-                {#each bookList as book}
-                    <option value={book}>{book}</option>
-                {/each}
-            </select>
-            <input 
-                type="text" 
-                placeholder="Search stories, authors, or tags..." 
-                bind:value={searchQuery}
-                class="search-bar"
-            />
+            <div class="filter-group">
+                <label for="book-filter">Book</label>
+                <select id="book-filter" bind:value={selectedBook} onchange={updateFilters} class="filter-select">
+                    <option value="All Books">All Books</option>
+                    {#each bookList as book}
+                        <option value={book}>{book}</option>
+                    {/each}
+                </select>
+            </div>
+            
+            <div class="filter-group">
+                <label for="search-input">Search</label>
+                <input 
+                    id="search-input"
+                    type="text" 
+                    placeholder="Search stories..." 
+                    bind:value={searchQuery}
+                    oninput={handleSearchInput}
+                    class="search-bar"
+                />
+            </div>
+
+            <div class="filter-group">
+                <label for="per-page">Per Page</label>
+                <select id="per-page" bind:value={perPage} onchange={updateFilters} class="filter-select mini">
+                    <option value="10">10</option>
+                    <option value="25">25</option>
+                    <option value="50">50</option>
+                </select>
+            </div>
+
+            <button class="bulk-ai-btn" onclick={handleBulkSummarize} disabled={isGenerating}>
+                {isGenerating ? 'Wait...' : '✨ Bulk AI'}
+            </button>
+
             <button class="add-btn" onclick={() => showAddForm = !showAddForm}>
                 {showAddForm ? 'Close Form' : '+ New Entry'}
             </button>
@@ -175,16 +260,9 @@
                     <div class="field full">
                         <div class="label-row">
                             <label for="summary">Summary</label>
-                            <button 
-                                type="button" 
-                                class="ai-btn" 
-                                onclick={(e) => handleAISummary(e, null)}
-                                disabled={isGenerating}
-                            >
-                                {isGenerating ? 'Generating...' : '✨ Ask AI'}
-                            </button>
+                            <span class="info-pill">Auto-summarized on save</span>
                         </div>
-                        <textarea name="summary" rows="3" placeholder="A brief description..."></textarea>
+                        <textarea name="summary" rows="3" placeholder="Click save to generate summary automatically..."></textarea>
                     </div>
                     <div class="field full">
                         <label for="tags">Tags (comma separated)</label>
@@ -197,11 +275,16 @@
     {/if}
 
     <section class="library-view">
+        <div class="pagination-info">
+            Showing {(data.pagination.page - 1) * data.pagination.perPage + 1} - {Math.min(data.pagination.page * data.pagination.perPage, data.pagination.totalItems)} of {data.pagination.totalItems} stories
+        </div>
+
         {#each Object.entries(groupedByBook) as [book, stories]}
             <div class="book-group">
                 <h2 class="book-title-header">{book}</h2>
                 <div class="stories-grid">
                     {#each stories as story (story.id)}
+                        <!-- ... same story card content ... -->
                         <article class="story-card" class:editing={editingId === story.id}>
                             {#if editingId === story.id}
                                 <div class="edit-mode-container">
@@ -211,9 +294,7 @@
                                                 await update();
                                                 editingId = null;
                                             } else if (result.type === 'failure') {
-                                                // Don't close or update if it failed
                                                 console.error('Update failed:', result.data);
-                                                // result.data will contain the { error, details } from fail()
                                                 await update({ reset: false });
                                             } else {
                                                 await update();
@@ -243,12 +324,12 @@
                                                     type="button" 
                                                     class="ai-btn small" 
                                                     onclick={(e) => handleAISummary(e, story.id)}
-                                                    disabled={isGenerating}
+                                                    disabled={isGenerating || story.queued}
                                                 >
-                                                    {isGenerating ? '...' : '✨ AI'}
+                                                    {story.queued ? 'Queued' : (isGenerating ? '...' : '✨ AI')}
                                                 </button>
                                             </div>
-                                            <textarea name="summary" class="edit-input" placeholder="Summary">{story.summary}</textarea>
+                                            <textarea name="summary" class="edit-input" placeholder="Summary" readonly={story.queued}>{story.summary}</textarea>
                                             
                                             <label class="edit-label">Story Content</label>
                                             <textarea name="content" class="edit-input content-area" placeholder="Paste or type the full story text here...">{story.content ?? ''}</textarea>
@@ -283,7 +364,11 @@
                                         {/each}
                                     </div>
                                     <div class="card-actions">
-                                        <a href="/story/{story.id}" class="read-btn">Read Story →</a>
+                                        {#if story.content && story.content.trim()}
+                                            <a href="/story/{story.id}" class="read-btn">Read Story →</a>
+                                        {:else}
+                                            <span class="read-btn disabled">No Content</span>
+                                        {/if}
                                         <button class="inline-edit-btn" onclick={() => toggleEdit(story.id)}>Edit Entry</button>
                                     </div>
                                 </div>
@@ -297,6 +382,42 @@
                 <p>No stories found matching your search.</p>
             </div>
         {/each}
+
+        {#if data.pagination.totalPages > 1}
+            <nav class="pagination">
+                <button 
+                    class="page-link" 
+                    class:disabled={data.pagination.page === 1}
+                    onclick={() => goToPage(data.pagination.page - 1)}
+                >
+                    &laquo; Prev
+                </button>
+                
+                {#each Array.from({ length: Math.min(5, data.pagination.totalPages) }, (_, i) => {
+                    // Simple sliding window for page numbers
+                    let start = Math.max(1, data.pagination.page - 2);
+                    let end = Math.min(data.pagination.totalPages, start + 4);
+                    if (end === data.pagination.totalPages) start = Math.max(1, end - 4);
+                    return start + i;
+                }).filter(p => p <= data.pagination.totalPages) as p}
+                    <button 
+                        class="page-link" 
+                        class:active={data.pagination.page === p}
+                        onclick={() => goToPage(p)}
+                    >
+                        {p}
+                    </button>
+                {/each}
+
+                <button 
+                    class="page-link" 
+                    class:disabled={data.pagination.page === data.pagination.totalPages}
+                    onclick={() => goToPage(data.pagination.page + 1)}
+                >
+                    Next &raquo;
+                </button>
+            </nav>
+        {/if}
     </section>
 </div>
 
@@ -325,8 +446,23 @@
 
     .controls {
         display: flex;
-        gap: 0.75rem;
+        gap: 1.5rem;
         flex-wrap: wrap;
+        align-items: flex-end;
+    }
+
+    .filter-group {
+        display: flex;
+        flex-direction: column;
+        gap: 0.4rem;
+    }
+
+    .filter-group label {
+        font-size: 0.75rem;
+        font-weight: 700;
+        text-transform: uppercase;
+        color: #94a3b8;
+        letter-spacing: 0.05em;
     }
 
     .filter-select {
@@ -336,14 +472,21 @@
         background-color: white;
         color: #1e293b;
         cursor: pointer;
+        min-width: 140px;
+        transition: border-color 0.2s;
     }
+
+    .filter-select:hover { border-color: #94a3b8; }
+    .filter-select.mini { min-width: 80px; }
 
     .search-bar {
         padding: 0.6rem 1rem;
         border-radius: 8px;
         border: 1px solid #cbd5e1;
-        width: 250px;
+        width: 300px;
+        transition: all 0.2s;
     }
+    .search-bar:focus { outline: none; border-color: #2563eb; ring: 2px solid #dbeafe; }
 
     .add-btn {
         background-color: #2563eb;
@@ -353,7 +496,24 @@
         border-radius: 8px;
         font-weight: 600;
         cursor: pointer;
+        height: 38px;
     }
+
+    .bulk-ai-btn {
+        background: #f5f3ff;
+        color: #7c3aed;
+        border: 1px solid #ddd6fe;
+        padding: 0.6rem 1rem;
+        border-radius: 8px;
+        font-weight: 600;
+        cursor: pointer;
+        height: 38px;
+        transition: all 0.2s;
+    }
+    .bulk-ai-btn:hover:not(:disabled) { background: #ede9fe; border-color: #c4b5fd; }
+    .bulk-ai-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+    .info-pill { font-size: 0.7rem; color: #94a3b8; background: #f8fafc; padding: 2px 8px; border-radius: 999px; }
 
     .logout-btn {
         background: none;
@@ -480,6 +640,14 @@
         transition: background 0.15s, border-color 0.15s;
     }
     .read-btn:hover { background: #dbeafe; border-color: #93c5fd; }
+    
+    .read-btn.disabled {
+        background: #f1f5f9;
+        color: #94a3b8;
+        border-color: #e2e8f0;
+        cursor: not-allowed;
+        pointer-events: none;
+    }
 
     .edit-label { font-size: 0.8rem; font-weight: 600; color: #64748b; margin-bottom: 0.25rem; display: block; }
     .content-area { min-height: 200px; font-family: Georgia, serif; font-size: 0.95rem; line-height: 1.7; }
@@ -526,5 +694,56 @@
         background: rgba(255, 255, 255, 0.5);
         padding: 0.5rem;
         border-radius: 4px;
+    }
+
+    /* Pagination Styles */
+    .pagination {
+        display: flex;
+        justify-content: center;
+        align-items: center;
+        gap: 0.5rem;
+        margin-top: 4rem;
+        background: white;
+        padding: 1rem;
+        border-radius: 12px;
+        box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+    }
+
+    .page-link {
+        padding: 0.5rem 1rem;
+        border-radius: 8px;
+        border: 1px solid #e2e8f0;
+        background: white;
+        color: #475569;
+        text-decoration: none;
+        font-weight: 600;
+        cursor: pointer;
+        transition: all 0.2s;
+    }
+
+    .page-link:hover:not(.disabled):not(.active) {
+        background: #f8fafc;
+        border-color: #cbd5e1;
+        color: #1e293b;
+    }
+
+    .page-link.active {
+        background: #2563eb;
+        color: white;
+        border-color: #2563eb;
+    }
+
+    .page-link.disabled {
+        opacity: 0.4;
+        cursor: not-allowed;
+    }
+
+    .pagination-info {
+        color: #94a3b8;
+        font-size: 0.85rem;
+        font-weight: 500;
+        margin-bottom: 2rem;
+        text-align: center;
+        letter-spacing: 0.025em;
     }
 </style>
